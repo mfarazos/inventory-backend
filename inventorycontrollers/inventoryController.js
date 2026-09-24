@@ -1502,7 +1502,7 @@ const getwalkingcustomer = async (req, res) => {
     const groupByName = groupby_name !== undefined && !["false", "0", "no"].includes(
       String(groupby_name).toLowerCase()
     );
-    const groupByField = groupByName ? "$clientName" : "$billNo";
+    const groupByField = groupByName ? { $let: { vars: { refNo: { $trim: { input: { $ifNull: ["$ref_no", ""] } } } }, in: { $cond: [{ $ne: ["$$refNo", ""] }, { $toLower: "$$refNo" }, { $concat: ["missing-ref:", { $toString: "$_id" }] }] } } } : "$billNo";
 
     const matchCondition = { userType: "walkingCustomer" };
 
@@ -1535,9 +1535,7 @@ const getwalkingcustomer = async (req, res) => {
         $group: {
           _id: groupByField,
           clientName: { $first: "$clientName" },
-          phoneNumber: { $first: "$phoneNumber" },
-          billNo: { $first: "$billNo" },
-          ref_no: { $max: "$ref_no" },
+          ref_no: { $first: "$ref_no" },
           latestCreatedAt: { $max: "$createdAt" },
           latestDate: { $max: "$date" }
         }
@@ -1547,17 +1545,15 @@ const getwalkingcustomer = async (req, res) => {
         $project: {
           _id: 0,
           phoneNumber: {
-            $cond: [groupByName, "$phoneNumber", "$_id"]
+            $cond: [groupByName, "$ref_no", "$_id"]
           },
-          billNo: "$billNo",
+          billNo: { $cond: [groupByName, "$$REMOVE", "$_id"] },
           ref_no: {
             $ifNull: ["$ref_no", ""]
           },
-          clientName: {
-            $cond: [groupByName, "$_id", "$clientName"]
-          },
+          clientName: "$clientName",
           groupBy: {
-            $literal: groupByName ? "clientName" : "billNo"
+            $literal: groupByName ? "ref_no" : "billNo"
           }
         }
       },
