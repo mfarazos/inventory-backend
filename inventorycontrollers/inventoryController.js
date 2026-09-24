@@ -31,6 +31,99 @@ const PurchasePaymentData = mongoose.model("PurchasePayment", purchasePaymentSch
 const escapeRegex = (text = "") =>
   String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const getBillMonthKey = (value) => {
+  const rawValue = String(value || "").trim();
+  const datePrefix = rawValue.match(/^(\d{4})-(\d{2})/);
+
+  if (datePrefix) {
+    const monthNumber = Number(datePrefix[2]);
+    if (monthNumber >= 1 && monthNumber <= 12) {
+      return `${datePrefix[1]}-${datePrefix[2]}`;
+    }
+  }
+
+  const parsedDate = new Date(value);
+  if (Number.isNaN(parsedDate.getTime())) return null;
+  return parsedDate.toISOString().slice(0, 7);
+};
+
+const normalizeLedgerDate = (value) => {
+  const rawValue = String(value || "").trim();
+  const datePrefix = rawValue.match(/^(\d{4})-(\d{2})-(\d{2})/);
+
+  if (datePrefix) {
+    const normalizedDate = new Date(`${datePrefix[1]}-${datePrefix[2]}-${datePrefix[3]}T00:00:00.000Z`);
+    if (!Number.isNaN(normalizedDate.getTime())) return normalizedDate;
+  }
+
+  const parsedDate = new Date(value);
+  return Number.isNaN(parsedDate.getTime()) ? null : parsedDate;
+};
+
+const getBillMonthRange = (monthKey) => {
+  const [year, month] = String(monthKey).split("-").map(Number);
+  return {
+    startDate: new Date(Date.UTC(year, month - 1, 1)),
+    endDate: new Date(Date.UTC(year, month, 1)),
+  };
+};
+
+const applyBillOwnerFilter = (query, customer, forBillCollection = false) => {
+  query.userType = customer.userType;
+
+  if (customer.userType === "specificCustomer") {
+    query.userId = customer.userId;
+    return query;
+  }
+
+  if (customer.userType === "walkingCustomer") {
+    const refNo = String(customer.ref_no || "").trim();
+
+    if (forBillCollection) {
+      const ownerConditions = [];
+      if (refNo) {
+        ownerConditions.push({ ref_no: refNo }, { phoneNumber: refNo });
+      }
+      if (customer.phoneNumber && customer.phoneNumber !== refNo) {
+        ownerConditions.push({ phoneNumber: customer.phoneNumber });
+      }
+      if (ownerConditions.length) query.$or = ownerConditions;
+    } else if (refNo) {
+      query.ref_no = refNo;
+    } else {
+      query.phoneNumber = customer.phoneNumber;
+    }
+  }
+
+  return query;
+};
+
+const removeOrphanBillRecords = async (billNo) => {
+  const billRecords = await billdata.find({ billNo }).lean();
+  const orphanBillIds = [];
+
+  for (const billRecord of billRecords) {
+    const { startDate, endDate } = getBillMonthRange(billRecord.month);
+    const owner = {
+      userType: billRecord.userType,
+      userId: billRecord.userId,
+      ref_no: billRecord.ref_no,
+      phoneNumber: billRecord.phoneNumber,
+    };
+    const matchingEntryQuery = applyBillOwnerFilter({
+      billNo: billRecord.billNo,
+      date: { $gte: startDate, $lt: endDate },
+    }, owner);
+    const hasMatchingEntry = await Customerdata.exists(matchingEntryQuery);
+
+    if (!hasMatchingEntry) orphanBillIds.push(billRecord._id);
+  }
+
+  if (orphanBillIds.length) {
+    await billdata.deleteMany({ _id: { $in: orphanBillIds } });
+  }
+};
+
 const generateWalkingCustomerRefNo = async () => {
   const latestRef = await Customerdata.aggregate([
     {
@@ -1020,50 +1113,16 @@ const createCustomer = async (req, res) => {
       return res.status(400).json({ error: 'All fields are required: date, clientName, quality, dcNumber, weightPure, weightMixing, rate, amount, billNo' });
     }
 
-    let makeDate = new Date(date).toISOString().slice(0, 7);
-
-    let newBill = {
-      month: makeDate,
-      userType: userType,
-    };
-
-    if (userType === "walkingCustomer") {
-      newBill.phoneNumber = phoneNumber;
-    }
-
-    if (userType === "specificCustomer") {
-      newBill.userId = userId;
-    }
-
-    let getBill = await billdata.findOne(newBill);
-
-    if (getBill) {
-      if (billNo !== getBill.billNo) {
-    return res.status(404).json({
-    success: false,
-     message: `The bill number you provided (${getBill.billNo}) does not exist.`,
-  });
-}
-      billNo = getBill.billNo;
-    } else {
-      
-      billNo = billNo;
-      newBill.billNo = billNo;
-      
-      const createdBill = new billdata(newBill);
-      await createdBill.save();
-    }
-
-    if (extraRate > 0) {
-      additionalRate = true;
-    } else {
-      additionalRate = false;
+    billNo = String(billNo || "").trim();
+    if (!billNo) {
+      return res.status(400).json({
+        success: false,
+        message: "billNo is required",
+      });
     }
 
     if (userType === "walkingCustomer") {
-      if (ref_no) {
-        ref_no = String(ref_no).trim();
-      }
+      ref_no = String(ref_no || "").trim();
 
       if (!ref_no) {
         const existingWalkingCustomer = await Customerdata.findOne({
@@ -1079,12 +1138,93 @@ const createCustomer = async (req, res) => {
       }
     }
 
+    const normalizedDate = normalizeLedgerDate(date);
+    const makeDate = normalizedDate ? getBillMonthKey(normalizedDate) : null;
+    if (!normalizedDate || !makeDate) {
+      return res.status(400).json({
+        success: false,
+        message: "date must be valid",
+      });
+    }
+
+    await removeOrphanBillRecords(billNo);
+
+    let newBill = {
+      month: makeDate,
+      userType: userType,
+    };
+
+    const billLookupQuery = {
+      month: makeDate,
+      userType,
+    };
+
+    if (userType === "walkingCustomer") {
+      newBill.phoneNumber = ref_no;
+      newBill.ref_no = ref_no;
+      billLookupQuery.$or = [
+        { ref_no },
+        { phoneNumber: ref_no },
+      ];
+
+      if (phoneNumber && phoneNumber !== ref_no) {
+        billLookupQuery.$or.push({ phoneNumber });
+      }
+    }
+
+    if (userType === "specificCustomer") {
+      newBill.userId = userId;
+      billLookupQuery.userId = userId;
+    }
+
+    let getBill = await billdata.findOne(billLookupQuery);
+
+    if (getBill) {
+      const { startDate, endDate } = getBillMonthRange(makeDate);
+      const billOwner = { userType, userId, ref_no, phoneNumber };
+      const matchingEntryQuery = applyBillOwnerFilter({
+        billNo: getBill.billNo,
+        date: { $gte: startDate, $lt: endDate },
+      }, billOwner);
+      const hasMatchingEntry = await Customerdata.exists(matchingEntryQuery);
+
+      if (!hasMatchingEntry) {
+        await billdata.deleteMany({
+          ...billLookupQuery,
+          billNo: getBill.billNo,
+        });
+        getBill = null;
+      }
+    }
+
+    let createdBill = null;
+
+    if (getBill) {
+      if (billNo !== String(getBill.billNo)) {
+        return res.status(409).json({
+          success: false,
+          message: `This customer already has bill number ${getBill.billNo} for ${makeDate}.`,
+        });
+      }
+      billNo = getBill.billNo;
+    } else {
+      newBill.billNo = billNo;
+
+      createdBill = new billdata(newBill);
+      await createdBill.save();
+    }
+
+    if (extraRate > 0) {
+      additionalRate = true;
+    } else {
+      additionalRate = false;
+    }
 
     // Extruding customers me mixing ka column nahi aata, uski jagah per-variety weights aate hain
     const saleWeights = resolveSaleWeights(req.body);
 
     const newCustomer = new Customerdata({
-      date,
+      date: normalizedDate,
       clientName,
       quality,
       dcNumber,
@@ -1109,7 +1249,14 @@ const createCustomer = async (req, res) => {
       description,
     });
 
-    await newCustomer.save();
+    try {
+      await newCustomer.save();
+    } catch (saveError) {
+      if (createdBill?._id) {
+        await billdata.deleteOne({ _id: createdBill._id });
+      }
+      throw saveError;
+    }
 
     res.status(201).json({ message: 'Customer created successfully', customer: newCustomer });
 
@@ -1127,35 +1274,68 @@ const editCustomer = async (req, res) => {
     if (!_id) {
       return res.status(400).json({ error: 'Customer ID is required' });
     }
-    
-    let customerData = await Customerdata.findOne({_id: _id })
+
+    const customerData = await Customerdata.findOne({_id: _id });
     if(!customerData){
-      return "not found"
+      return res.status(404).json({ error: 'Customer not found' });
     }
 
-    await billdata.findOneAndUpdate({billNo: customerData.billNo }, {billNo: billNo});
+    const previousBillNo = String(customerData.billNo || "");
+    const nextBillNo = billNo === undefined
+      ? previousBillNo
+      : String(billNo).trim();
 
-    
-    
-    //billNo tem remove 
+    if (!nextBillNo) {
+      return res.status(400).json({ error: 'billNo is required' });
+    }
+
+    const normalizedEditDate = date === undefined
+      ? customerData.date
+      : normalizeLedgerDate(date);
+    if (!normalizedEditDate) {
+      return res.status(400).json({ error: 'date must be valid' });
+    }
+
+    const billMonth = getBillMonthKey(customerData.date);
+    const { startDate, endDate } = getBillMonthRange(billMonth);
+    const billRecordQuery = applyBillOwnerFilter({
+      billNo: previousBillNo,
+      month: billMonth,
+    }, customerData, true);
+    const customerBillQuery = applyBillOwnerFilter({
+      billNo: previousBillNo,
+      date: { $gte: startDate, $lt: endDate },
+    }, customerData);
+
+    if (nextBillNo !== previousBillNo) {
+      await billdata.updateMany(
+        billRecordQuery,
+        { $set: { billNo: nextBillNo } },
+        { runValidators: true }
+      );
+    }
 
     const saleWeights = resolveSaleWeights(req.body);
 
     const updatedCustomer = await Customerdata.findByIdAndUpdate(
       _id,
       {
-        date, clientName, quality, dcNumber,
+        date: normalizedEditDate, clientName, quality, dcNumber,
         weightPure,
         weightMixing: saleWeights.weightMixing,   // mixing + saari varieties ka total
         ...saleWeights.varietyWeights,            // har variety ka apna weight
         grossWeight: saleWeights.grossWeight,
-        rate, amount, status, product, ratio, phoneNumber, additionalRate, extraRate , extraAmount, totalAmount, description
+        rate, amount, billNo: nextBillNo, status, product, ratio, phoneNumber, additionalRate, extraRate , extraAmount, totalAmount, description
       },
       { new: true, runValidators: true }
     );
 
-    await Customerdata.updateMany({billNo: customerData.billNo }, {billNo: billNo});
-
+    if (nextBillNo !== previousBillNo) {
+      await Customerdata.updateMany(
+        { ...customerBillQuery, _id: { $ne: customerData._id } },
+        { $set: { billNo: nextBillNo } }
+      );
+    }
 
     if (!updatedCustomer) {
       return res.status(404).json({ error: 'Customer not found' });
@@ -1171,24 +1351,40 @@ const editCustomer = async (req, res) => {
 
 const deleteCustomer = async (req, res) => {
   try {
-  
     const { id } = req.params;
 
-  
-    if (!id) {
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Customer ID is required' });
     }
 
-
-    const deletedCustomer = await Customerdata.findByIdAndDelete(id);
-
-   
-    if (!deletedCustomer) {
+    const customer = await Customerdata.findById(id);
+    if (!customer) {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    
-    res.status(200).json({ message: 'Customer deleted successfully', customer: deletedCustomer });
+    const deletedCustomer = await Customerdata.findByIdAndDelete(id);
+
+    const billMonth = getBillMonthKey(customer.date);
+    const { startDate, endDate } = getBillMonthRange(billMonth);
+    const remainingBillEntriesQuery = applyBillOwnerFilter({
+      billNo: customer.billNo,
+      date: { $gte: startDate, $lt: endDate },
+    }, customer);
+    const hasRemainingBillEntries = await Customerdata.exists(remainingBillEntriesQuery);
+
+    if (!hasRemainingBillEntries) {
+      const billRecordQuery = applyBillOwnerFilter({
+        billNo: customer.billNo,
+        month: billMonth,
+      }, customer, true);
+      await billdata.deleteMany(billRecordQuery);
+    }
+
+    res.status(200).json({
+      message: 'Customer deleted successfully',
+      customer: deletedCustomer,
+      billRemoved: !hasRemainingBillEntries,
+    });
   } catch (error) {
     console.error(error); 
     res.status(500).json({ error: 'Error deleting customer' });

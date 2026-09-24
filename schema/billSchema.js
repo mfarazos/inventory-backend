@@ -19,6 +19,11 @@ month: {
     required: false, 
   },
 
+ ref_no: {
+    type: String,
+    required: false,
+  },
+
  userId: {
     type: String,
     required: false, 
@@ -35,7 +40,6 @@ month: {
 });
 
   module.exports = { billSchema };
-
 
 
 
